@@ -285,7 +285,7 @@ class PostFormatter:
                             and (
                                     0 < length_limit <= self.plain_length  # length_limit == 0 means no limit
                                     or
-                                    normal_msg_len > (4096 if not media_msg_count else 1024)
+                                    normal_msg_len > (512 if not media_msg_count else 256)
                             )
                     )
                     or
@@ -440,7 +440,7 @@ class PostFormatter:
                 title_text = Text(title)
             else:  # NO_TITLE
                 title_text = None
-            title_html = Bold(Underline(title_text)).get_html() if title_text else None
+            title_html = Bold(title_text).get_html() if title_text else None
 
             # ---- via ----
             if via_type == FEED_TITLE_VIA_W_LINK:
@@ -477,9 +477,9 @@ class PostFormatter:
 
             # ---- title ----
             if title_type == POST_TITLE_W_LINK:
-                title_html = Bold(Underline(Link(title, param=self.link))).get_html()
+                title_html = Bold(Link(title, param=self.link)).get_html()
             elif title_type == POST_TITLE_NO_LINK:
-                title_html = Bold(Underline(title)).get_html()
+                title_html = Bold(title).get_html()
             else:  # NO_TITLE
                 title_html = None
 
