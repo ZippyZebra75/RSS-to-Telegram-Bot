@@ -30,16 +30,16 @@ from .html_node import *
 from .medium import Media, AbstractMedium, Image, Video, Audio, File, Animation
 from ..web.media import construct_weserv_url_convert_to_2560
 
-AUTO: Final = 0
+AUTO: Final = 1
 DISABLE: Final = -1
 FORCE_DISPLAY: Final = 1
 FORCE_ENABLE: Final = 1
 FORCE_LINK: Final = -1
-FORCE_TELEGRAPH: Final = 1
+FORCE_TELEGRAPH: Final = 0
 FORCE_MESSAGE: Final = 2
-FEED_TITLE_AND_LINK: Final = 0
+FEED_TITLE_AND_LINK: Final = -3
 FEED_TITLE_AND_LINK_AS_POST_TITLE: Final = 1
-NO_FEED_TITLE_BUT_LINK_AS_POST_TITLE: Final = -3
+NO_FEED_TITLE_BUT_LINK_AS_POST_TITLE: Final = 0
 NO_FEED_TITLE_BUT_TEXT_LINK: Final = -1
 NO_FEED_TITLE_BUT_BARE_LINK: Final = -4
 COMPLETELY_DISABLE: Final = -2
