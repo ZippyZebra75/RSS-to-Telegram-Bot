@@ -15,10 +15,11 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
-from typing import Sequence, MutableMapping, Union, Final, ClassVar, Optional, Any
+from typing import Sequence, MutableMapping, Union, Final, ClassVar, Optional, Any, Callable, Awaitable
 
 import asyncio
 from collections import defaultdict, Counter
+from telethon import hints
 from telethon.errors import BadRequestError
 from traceback import format_exc
 
@@ -26,7 +27,7 @@ from ._common import logger, TIMEOUT
 from ._stat import NotifierStat
 from .. import db, env, web
 from ..command import inner
-from ..command.utils import unsub_all_and_leave_chat, escape_html
+from ..command.utils import default_leave_chat_helper, escape_html
 from ..compat import nullcontext
 from ..errors_collection import EntityNotFoundError, UserBlockedErrors
 from ..helpers.bg import bg
@@ -42,7 +43,7 @@ class Notifier:
     _stat: ClassVar[NotifierStat] = NotifierStat()
 
     # it may cause memory leak, but they are too small that leaking thousands of that is still not a big deal!
-    _user_unsub_all_lock_bucket: ClassVar[dict[int, asyncio.Lock]] = defaultdict(asyncio.Lock)
+    _on_blocked_lock_bucket: ClassVar[dict[int, asyncio.Lock]] = defaultdict(asyncio.Lock)
     _user_blocked_counter: ClassVar[Counter] = Counter()
 
     def __init__(
@@ -51,6 +52,7 @@ class Notifier:
             subs: Sequence[db.Sub],
             entries: Optional[Sequence[MutableMapping]] = None,
             reason: Optional[Union[web.WebError, str]] = None,
+            on_blocked_cb: Callable[[hints.EntityLike], Awaitable[None]] = default_leave_chat_helper,
     ):
         if entries is not None and reason is not None:
             raise ValueError('entries and reason cannot be set at the same time')
@@ -58,6 +60,7 @@ class Notifier:
         self._subs: Final[set[db.Sub]] = set(subs)
         self._entries: Final[Optional[Sequence[MutableMapping]]] = entries
         self._reason: Final[Optional[Union[web.WebError, str]]] = reason
+        self._on_blocked_cb: Callable[[hints.EntityLike], Awaitable[None]] = on_blocked_cb
 
         self._entry_count: Final[int] = len(entries) if entries is not None else 0
         self._sub_count: Final[int] = len(subs)
@@ -273,7 +276,7 @@ class Notifier:
             try:
                 await env.bot.get_input_entity(user_id)  # verify that the input entity can be gotten first
             except ValueError:  # cannot get the input entity, the user may have banned the bot
-                return await self._locked_unsub_all_and_leave_chat(
+                return await self._on_blocked(
                     user_id=user_id,
                     err_msg=type(EntityNotFoundError).__name__,
                 )
@@ -285,10 +288,10 @@ class Notifier:
                 if self._user_blocked_counter[user_id]:  # reset the counter if success
                     del self._user_blocked_counter[user_id]
             except UserBlockedErrors as e:
-                return await self._locked_unsub_all_and_leave_chat(user_id=user_id, err_msg=type(e).__name__)
+                return await self._on_blocked(user_id=user_id, err_msg=type(e).__name__)
             except BadRequestError as e:
                 if e.message == 'TOPIC_CLOSED':
-                    return await self._locked_unsub_all_and_leave_chat(user_id=user_id, err_msg=e.message)
+                    return await self._on_blocked(user_id=user_id, err_msg=e.message)
         except Exception as e:
             logger.error(f'Failed to send {post.link} (feed: {post.feed_link}, user: {sub.user_id}):', exc_info=e)
             try:
@@ -314,18 +317,18 @@ class Notifier:
                 )
         return None
 
-    async def _locked_unsub_all_and_leave_chat(self, user_id: int, err_msg: str) -> None:
-        user_unsub_all_lock = self._user_unsub_all_lock_bucket[user_id]
-        if user_unsub_all_lock.locked():
+    async def _on_blocked(self, user_id: int, err_msg: str):
+        on_blocked_lock = self._on_blocked_lock_bucket[user_id]
+        if on_blocked_lock.locked():
             return  # no need to unsub twice!
-        async with user_unsub_all_lock:
+        async with on_blocked_lock:
             if self._user_blocked_counter[user_id] < 5:
                 self._user_blocked_counter[user_id] += 1
                 return  # skip once
             # fail for 5 times, consider been banned
             del self._user_blocked_counter[user_id]
             logger.error(f'User blocked ({err_msg}): {user_id}')
-            await unsub_all_and_leave_chat(user_id)
+            await self._on_blocked_cb(user_id)
             if self._raise_stop_pipeline_after_leave_chat:
                 raise StopPipeline()
 

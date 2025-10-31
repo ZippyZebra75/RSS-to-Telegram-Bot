@@ -20,7 +20,7 @@ from collections.abc import Sequence
 
 import re
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from bs4.element import SoupStrainer
 from urllib.parse import urljoin
@@ -99,7 +99,7 @@ async def sub(user_id: int,
             if created_new_feed or feed.state == 0:
                 feed.state = 1
                 feed.error_count = 0
-                feed.next_check_time = None
+                feed.next_check_time = wf.calc_next_check_as_per_server_side_cache()
                 etag = wr.etag
                 if etag:
                     feed.etag = etag
@@ -298,7 +298,7 @@ async def export_opml(user_id: int) -> Optional[bytes]:
     sub_list = await list_sub(user_id)
     opml = BeautifulSoup(OPML_TEMPLATE, 'lxml-xml')
     create_time = opml.new_tag('dateCreated')
-    create_time.string = opml.new_string(datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S UTC'))
+    create_time.string = opml.new_string(datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S UTC'))
     opml.head.append(create_time)
     empty_flags = True
     for _sub in sub_list:

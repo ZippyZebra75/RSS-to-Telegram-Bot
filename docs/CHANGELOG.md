@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Highlights
+
+- **Support Python 3.13**: Officially supports Python 3.13. The official Docker image is now based on Python 3.13 as well.
+
+### Enhancements
+
+- **Minor enhancements**: Some internal functions have been refined to enhance compatibility with various feeds. Two new environment variables have been added (`HTTP_MAX_LINE_SIZE` and `HTTP_MAX_FIELD_SIZE`, see [Advanced Settings](advanced-settings.md) for more details).
+- **Minor refactor**: Some internal functions have been refactored to improve performance, readability and maintainability.
+
+### Bug fixes
+
+- **Malformed `<`**: Fixed an issue where `<` in `<code>` or `<pre>` was rendered as `&LT`. This was an upstream issue, see also [wilsonzlin/minify-html#109](https://github.com/wilsonzlin/minify-html/issues/109).
+
+## v2.10.0: Container health check, chat-specific #hashtags, and more
+
+### Highlights
+
+- **Container health check**: The official Docker image includes an automatic health check to determine if the container is running properly. The health check status can be checked in `docker ps`. This feature, combined with [`autoheal`](https://github.com/willfarrell/docker-autoheal) or some other monitoring tool, can restart the container automatically when it is unhealthy.
+- **Support for chat-specific #hashtags**: Telegram recently added a feature called "chat-specific hashtags," formatting as `#hashtag@username`. However, escaping '@' broke these hashtags. Properly supports such hashtags by allowing '@' in hashtags.
+
+### Enhancements
+
+- **No longer proxies images from `*.wp.com` when generating Telegraph posts**: `*.wp.com` is in the blocklist of `wsrv.nl` (environment variable `IMAGES_WESERV_NL`). Thus, these images are no longer proxied when generating Telegraph posts. All images from `*.wp.com` can be accessed with any referer header, so they are now kept as is.
+- **Link to repo in UA**: The default User-Agent now contains a link to the repository, which can help webmasters identify the source of traffic and add RSStT into their allowlists.
+- **Minor enhancements**: Some internal functions have been refined to enhance compatibility with various feeds.
+- **Minor refactor**: Some internal functions have been refactored to improve performance, readability and maintainability.
+
+### Bug fixes
+
+- **Canonical `DATABASE_URL` not recognized**: Since v2.9.0, `DATABASE_URL` is canonicalized before connecting to the corresponding database. However, a canonical URL pointing to a local path cannot be recognized when checking the validity of the scheme (database type). Both canonical (`scheme:/path/to/file.db`) and traditional (`scheme:///path/to/file.db`) forms of such URLs are recognized correctly now.
+- **Monitoring not deferred as per server-side cache when subscribing**: Since v2.7.0, monitoring tasks will be deferred when aggressive server-side caches (e.g., Cloudflare and RSSHub, which make it futile to check for updates before cache expiration) are detected. However, the first monitoring task for a newly subscribed feed was not being deferred. This has been fixed and the first monitoring task now waits for the server-side cache to expire.
+- **Minor bug fixes**
+
+## v2.9.0: Telegraph-related revert, skip cert verification, and more
+
+### BREAKING CHANGES
+
+Media (image and video) are no longer uploaded when generating Telegraph posts due to [Telegraph disabling media upload](https://t.me/durov/343). (first introduced in v2.6.0)
+
 ### Addition
 
 - **Disable TLS certificate verification**: The environment variable `VERIFY_TLS` has been added to disable (when set to `0`) or enable (when set to `1`, default) TLS certificate verification. This is useful when subscribing to feeds with their TLS misconfigured. Note: Disabling TLS certificate verification is not recommended and should only be used as a last resort.

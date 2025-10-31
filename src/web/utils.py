@@ -1,5 +1,5 @@
 #  RSS to Telegram Bot
-#  Copyright (C) 2021-2024  Rongrong <i@rong.moe>
+#  Copyright (C) 2021-2025  Rongrong <i@rong.moe>
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU Affero General Public License as
@@ -15,7 +15,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
-from typing import Union, Optional, AnyStr, ClassVar
+from typing import Union, Optional, AnyStr, ClassVar, Iterable
 from typing_extensions import Final
 
 import aiohttp
@@ -23,11 +23,12 @@ import aiohttp.abc
 import email.utils
 import feedparser
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse
 from multidict import CIMultiDictProxy
+from propcache import cached_property
 
 from .. import env, log
 from ..i18n import i18n
@@ -59,7 +60,7 @@ class YummyCookieJar(aiohttp.abc.AbstractCookieJar):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__real_cookie_jar = aiohttp.DummyCookieJar(*args, **kwargs)
+        self.__real_cookie_jar: aiohttp.abc.AbstractCookieJar = aiohttp.DummyCookieJar(*args, **kwargs)
         self.__init_args = args
         self.__init_kwargs = kwargs
         self.__is_dummy = True
@@ -85,35 +86,54 @@ class YummyCookieJar(aiohttp.abc.AbstractCookieJar):
     def filter_cookies(self, *args, **kwargs):
         return self.__real_cookie_jar.filter_cookies(*args, **kwargs)
 
+    @property
+    def quote_cookie(self) -> bool:
+        return self.__real_cookie_jar.quote_cookie
+
 
 class WebError(Exception):
-    def __init__(self, error_name: str, status: Union[int, str] = None, url: str = None,
-                 base_error: Exception = None, hide_base_error: bool = False, log_level: int = log.DEBUG):
+    @staticmethod
+    def _join_snips(sep: str, snips: Iterable[str]) -> str:
+        return sep.join(filter(None, snips))
+
+    def __init__(
+            self,
+            error_name: str,
+            status: Union[int, str] = None,
+            url: str = None,
+            base_error: Exception = None,
+            log_level: int = log.DEBUG,
+    ):
         super().__init__(error_name)
         self.error_name = error_name
         self.status = status
         self.url = url
         self.base_error = base_error
-        self.hide_base_error = hide_base_error
-        log_msg = f'Fetch failed ({error_name}'
-        log_msg += (f', {type(base_error).__name__}'
-                    if not hide_base_error and base_error and log_level < log.ERROR
-                    else '')
-        log_msg += f', {status}' if status else ''
-        log_msg += ')'
-        log_msg += f': {url}' if url else ''
-        logger.log(log_level,
-                   log_msg,
-                   exc_info=base_error if not hide_base_error and base_error and log_level >= log.ERROR else None)
+        self.detail = self._join_snips(', ', (
+            type(base_error).__name__ if base_error else None,
+            status,
+        ))
+        reason = self._join_snips(', ', (
+            error_name,
+            self.detail,
+        ))
+        log_msg = self._join_snips(': ', (
+            f'Fetch failed ({reason})',
+            url,
+        ))
+        logger.log(
+            log_level,
+            log_msg,
+            exc_info=base_error if log_level >= log.ERROR or env.DEBUG else None,
+        )
 
     def i18n_message(self, lang: str = None) -> str:
         error_key = self.error_name.lower().replace(' ', '_')
-        msg = f'ERROR: {i18n[lang][error_key]}'
-        if not self.hide_base_error and self.base_error:
-            msg += f' ({type(self.base_error).__name__})'
-        if self.status:
-            msg += f' ({self.status})'
-        return msg
+        return self._join_snips(' ', (
+            'ERROR:',
+            i18n[lang][error_key],
+            f'({self.detail})' if self.detail else None,
+        ))
 
     def __str__(self) -> str:
         return self.i18n_message()
@@ -136,6 +156,9 @@ def rfc_2822_8601_to_datetime(time_str: Optional[str]) -> Optional[datetime]:
 
 @dataclass
 class WebResponse:
+    AGE_REMAINING_CLAMP_MIN: ClassVar[int] = 0
+    AGE_REMAINING_CLAMP_MAX: ClassVar[int] = 21600  # 6 hours
+
     url: str  # redirected url
     ori_url: str  # original url
     content: Optional[AnyStr]
@@ -143,92 +166,65 @@ class WebResponse:
     status: int
     reason: Optional[str]
 
-    _now: Optional[datetime] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-    _date: Optional[datetime] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-    _last_modified: Optional[datetime] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-    _max_age: Optional[int] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-    _age: Optional[int] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-    _age_remaining: Optional[int] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-    _expires: Optional[datetime] = field(default=sentinel, init=False, repr=False, hash=False, compare=False)
-
-    _age_remaining_clamp: ClassVar[range] = range(0, 3600 + 1)  # 1 hour
-
-    @property
+    @cached_property
     def etag(self) -> Optional[str]:
-        return self.headers.get('ETag')
+        return self.headers.get('ETag') or None  # Prohibit empty string
 
-    @property
+    @cached_property
     def now(self) -> datetime:
-        if self._now is sentinel:
-            self._now = datetime.now(timezone.utc)
-        return self._now
+        return datetime.now(timezone.utc)
 
-    @now.setter
-    def now(self, value: datetime):
-        self._now = value
-
-    @property
+    @cached_property
     def date(self) -> datetime:
-        if self._date is sentinel:
-            self._date = rfc_2822_8601_to_datetime(self.headers.get('Date')) or self.now
-        return self._date
+        return rfc_2822_8601_to_datetime(self.headers.get('Date')) or self.now
 
-    @property
+    @cached_property
     def last_modified(self) -> datetime:
-        if self._last_modified is sentinel:
-            self._last_modified = rfc_2822_8601_to_datetime(self.headers.get('Last-Modified')) or self.date
-        return self._last_modified
+        return rfc_2822_8601_to_datetime(self.headers.get('Last-Modified')) or self.date
 
-    @property
+    @cached_property
     def max_age(self) -> Optional[int]:
-        if self._max_age is not sentinel:
-            return self._max_age
         cache_control = self.headers.get('Cache-Control', '').lower()
         if not cache_control:
-            self._max_age = None
+            return None
         elif 'no-cache' in cache_control or 'no-store' in cache_control:
-            self._max_age = 0
+            return 0
         elif max_age := cache_control.partition('max-age=')[2].partition(',')[0]:
             try:
-                self._max_age = int(max_age) if max_age else None
+                return int(max_age) if max_age else None
             except ValueError:
-                self._max_age = None
-        else:
-            self._max_age = None
-        return self._max_age
+                return None
+        return None
 
-    @property
+    @cached_property
     def age(self) -> Optional[int]:
-        if self._age is sentinel:
-            age = self.headers.get('Age')
-            try:
-                self._age = int(age) if age else None
-            except ValueError:
-                self._age = None
-        return self._age
+        age = self.headers.get('Age')
+        try:
+            return int(age) if age else None
+        except ValueError:
+            return None
 
-    @property
+    @cached_property
     def age_remaining(self) -> Optional[int]:
-        if self._age_remaining is sentinel:
-            if self.max_age is None:
-                self._age_remaining = None
-            else:
-                self._age_remaining = self.max_age - (self.age or 0)
-                if self._age_remaining < self._age_remaining_clamp.start:
-                    self._age_remaining = self._age_remaining_clamp.start
-                elif self._age_remaining > self._age_remaining_clamp.stop:
-                    self._age_remaining = self._age_remaining_clamp.stop
-        return self._age_remaining
+        if self.max_age is None:
+            return None
+        else:
+            age_remaining = self.max_age - (self.age or 0)
+            if age_remaining < (clamp_min := self.AGE_REMAINING_CLAMP_MIN):
+                return clamp_min
+            elif age_remaining > (clamp_max := self.AGE_REMAINING_CLAMP_MAX):
+                return clamp_max
+            return age_remaining
 
-    @property
+    @cached_property
     def expires(self) -> Optional[datetime]:
-        if self._expires is sentinel:
-            # max-age overrides Expires: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Expires
-            if self.age_remaining is None:
-                self._expires = rfc_2822_8601_to_datetime(self.headers.get('Expires'))
-            else:
-                self._expires = self.date + timedelta(seconds=self.age_remaining)
-        return self._expires
+        # max-age overrides Expires: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Expires
+        if self.age_remaining is None:
+            return rfc_2822_8601_to_datetime(self.headers.get('Expires'))
+        elif self.age_remaining <= 0:
+            return None
+        else:
+            return self.date + timedelta(seconds=self.age_remaining)
 
 
 @dataclass
@@ -243,6 +239,42 @@ class WebFeed:
     error: Optional[WebError] = None
 
     web_response: Optional[WebResponse] = None
+
+    def calc_next_check_as_per_server_side_cache(self) -> Optional[datetime]:
+        wr = self.web_response
+        if wr is None:
+            return None
+        now = wr.now
+
+        # defer next check as per Cloudflare cache
+        # https://developers.cloudflare.com/cache/concepts/cache-responses/
+        # https://developers.cloudflare.com/cache/how-to/edge-browser-cache-ttl/
+        if self.headers.get('cf-cache-status') in {'HIT', 'MISS', 'EXPIRED', 'REVALIDATED'}:
+            expires = wr.expires
+            if expires and expires > now:
+                return expires
+
+        # defer next check as per RSSHub TTL (or Cache-Control max-age)
+        # only apply when TTL > 5min,
+        # as it is the default value of RSSHub and disabling cache won't change it in some legacy versions
+        rss_d = self.rss_d
+        if (
+                rss_d.feed.get('generator') == 'RSSHub'
+                and
+                (updated_str := rss_d.feed.get('updated'))
+        ):
+            ttl_in_minute_str: str = rss_d.feed.get('ttl', '')
+            ttl_in_second = (
+                                int(ttl_in_minute_str) * 60
+                                if ttl_in_minute_str.isdecimal()
+                                else wr.max_age
+                            ) or -1
+            if ttl_in_second > 300:
+                updated = rfc_2822_8601_to_datetime(updated_str)
+                if updated and (next_check_time := updated + timedelta(seconds=ttl_in_second)) > now:
+                    return next_check_time
+
+        return None
 
 
 def proxy_filter(url: str, parse: bool = True) -> bool:
