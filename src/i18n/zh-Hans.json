@@ -58,7 +58,9 @@
         "other_settings_button": "其他设置…",
         "user": "用户",
         "channel": "频道",
-        "group": "群组"
+        "group": "群组",
+        "test_no_subscriptions": "你还没有订阅任何源。",
+        "test_no_entries": "该源没有任何条目。"
     },
     "l10n_cmd_sub": {
         "sub_reply_feed_url_prompt_html": "请用订阅 URL 回复这条消息。\n或者，你也可以使用 <code>/sub url1 url2 url3 …</code> 来批量订阅。",

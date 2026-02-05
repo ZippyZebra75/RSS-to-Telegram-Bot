@@ -54,6 +54,7 @@ logger = log.getLogger('RSStT')
 loop = env.loop
 bot: Optional[TelegramClient] = None
 pre_tasks = []
+shutdown_requested = False
 
 monitor = Monitor()
 scheduler = AsyncIOScheduler(event_loop=loop)
@@ -90,7 +91,11 @@ def init():
         exit(0)
 
     sleep_for = 0
-    while api_keys:
+    max_retries = 3
+    attempt = 0
+
+    while api_keys and attempt < max_retries:
+        attempt += 1
         sleep_for += 10
         api_id, api_hash = api_keys.popitem()
         try:
@@ -105,22 +110,32 @@ def init():
             logger.warning(f'API_ID_PUBLISHED_FLOOD_ERROR occurred. Sleep for {sleep_for}s and retry.')
             sleep(sleep_for)
         except Exception as e:
-            logger.critical('Unknown error occurred during login:', exc_info=e)
-            break
+            logger.critical(f'Unknown error occurred during login (attempt {attempt}/{max_retries}):', exc_info=e)
+            if attempt >= max_retries or not api_keys:
+                break
+            logger.warning(f'Retrying in {sleep_for}s...')
+            sleep(sleep_for)
 
     if bot is None:
-        logger.critical('LOGIN FAILED!')
+        logger.critical('LOGIN FAILED after all retry attempts!')
         exit(1)
 
     env.bot = bot
-    env.bot_peer = loop.run_until_complete(bot.get_me(input_peer=False))
-    env.bot_input_peer = loop.run_until_complete(bot.get_me(input_peer=True))
-    env.bot_id = env.bot_peer.id
+    try:
+        env.bot_peer = loop.run_until_complete(bot.get_me(input_peer=False))
+        env.bot_input_peer = loop.run_until_complete(bot.get_me(input_peer=True))
+        env.bot_id = env.bot_peer.id
+    except Exception as e:
+        logger.critical('Failed to get bot information:', exc_info=e)
+        exit(1)
 
 
 async def pre():
-    # wait for pre tasks
-    await asyncio.gather(*pre_tasks)
+    # wait for pre tasks with error handling
+    try:
+        await asyncio.gather(*pre_tasks, return_exceptions=True)
+    except Exception as e:
+        logger.error('Error in pre-tasks, continuing anyway:', exc_info=e)
 
     bare_target_matcher = r'(?P<target>@\w{4,}|(-100|\+)\d+)'
     target_matcher = rf'(\s+{bare_target_matcher})?'
@@ -164,6 +179,8 @@ async def pre():
                           events.NewMessage(pattern=construct_remote_command_matcher('/lang')))
     bot.add_event_handler(command.misc.cmd_version,
                           events.NewMessage(pattern=construct_command_matcher('/version')))
+    bot.add_event_handler(command.misc.cmd_test_random,
+                          events.NewMessage(pattern=construct_command_matcher('/tst')))
     bot.add_event_handler(command.administration.cmd_test,
                           events.NewMessage(pattern=construct_remote_command_matcher('/test')))
     bot.add_event_handler(command.administration.cmd_user_info_or_callback_set_user,
@@ -279,32 +296,98 @@ async def lazy():
 
 async def post():
     logger.info('Exiting gracefully...')
-    tasks = [
-        asyncio.shield(loop.create_task(db.close())),
-        loop.create_task(tgraph.close()),
-        loop.create_task(bg.close()),
-        loop.create_task(queued.close()),
-    ]
+    tasks = []
+    errors = []
+
+    # Close database connection with error handling
+    try:
+        tasks.append(asyncio.shield(loop.create_task(db.close())))
+    except Exception as e:
+        logger.error('Error scheduling database close:', exc_info=e)
+
+    # Telegraph cleanup
+    try:
+        tasks.append(loop.create_task(tgraph.close()))
+    except Exception as e:
+        logger.error('Error scheduling telegraph close:', exc_info=e)
+
+    # Background task cleanup
+    try:
+        tasks.append(loop.create_task(bg.close()))
+    except Exception as e:
+        logger.error('Error scheduling bg close:', exc_info=e)
+
+    # Queue cleanup
+    try:
+        tasks.append(loop.create_task(queued.close()))
+    except Exception as e:
+        logger.error('Error scheduling queue close:', exc_info=e)
+
+    # Stop scheduler
     if scheduler.running:
-        scheduler.shutdown(wait=False)
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.error('Error shutting down scheduler:', exc_info=e)
+
+    # Disconnect bot
     if bot and bot.is_connected():
-        tasks.append(bot.disconnect())
-    res = await asyncio.gather(*tasks, return_exceptions=True)
-    for e in (e for e in res if isinstance(e, BaseException)):
-        logger.error('Error when exiting gracefully: ', exc_info=e)
-    aio_helper.shutdown()
+        try:
+            tasks.append(bot.disconnect())
+        except Exception as e:
+            logger.error('Error scheduling bot disconnect:', exc_info=e)
+
+    # Execute all cleanup tasks with timeout
+    if tasks:
+        try:
+            res = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=8)
+            for e in (e for e in res if isinstance(e, BaseException)):
+                errors.append(e)
+                logger.error('Error during cleanup task: ', exc_info=e)
+        except asyncio.TimeoutError:
+            logger.warning('Cleanup tasks timed out after 8 seconds')
+
+    # Final shutdown
+    try:
+        aio_helper.shutdown()
+    except Exception as e:
+        logger.error('Error during aio_helper shutdown:', exc_info=e)
+
+    if errors:
+        logger.warning(f'Completed cleanup with {len(errors)} error(s)')
 
 
 def force_quit(*_):
     logger.critical('Force quitting...', stack_info=True)
+    # Try graceful shutdown first before SIGKILL
+    try:
+        if bot and bot.is_connected():
+            loop.run_until_complete(bot.disconnect())
+    except Exception:
+        pass
     os.kill(os.getpid(), signal.SIGKILL)
 
 
 def sig_handler(signum, *_, **__):
+    global shutdown_requested
+    if shutdown_requested:
+        logger.critical('Already shutting down, forcing quit...')
+        force_quit()
+        return
+
+    shutdown_requested = True
     try:
-        logger.warning(f'Received signal {signal.Signals(signum).name}')
+        signal_name = signal.Signals(signum).name
     except ValueError:
-        logger.warning(f'Received signal {signum}')
+        signal_name = str(signum)
+
+    logger.warning(f'Received signal {signal_name}, initiating graceful shutdown...')
+
+    # Set a timeout to force quit if graceful shutdown takes too long
+    if getattr(signal, 'SIGALRM', None):
+        signal.alarm(10)
+        signal.signal(signal.SIGALRM, force_quit)
+
     exit(128 + signum)
 
 
@@ -315,7 +398,12 @@ def main():
     exit_code = 100
 
     try:
+        # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, sig_handler)  # graceful exit handler
+        try:
+            signal.signal(signal.SIGINT, sig_handler)  # handle Ctrl+C
+        except ValueError:
+            pass  # SIGINT may not be available in all environments
 
         init()
 
@@ -340,7 +428,14 @@ def main():
             logger.warning('Bot manager privileged mode is enabled! '
                            'Use with caution and should be disabled in production!')
 
-        loop.create_task(lazy())
+        # Wrap lazy task in error handler
+        async def run_lazy_safe():
+            try:
+                await lazy()
+            except Exception as e:
+                logger.error('Error in lazy initialization task:', exc_info=e)
+
+        loop.create_task(run_lazy_safe())
 
         scheduler.add_job(func=monitor.run_periodic_task,
                           trigger=CronTrigger(minute='*', second=env.CRON_SECOND, timezone='UTC'),
@@ -350,12 +445,13 @@ def main():
 
         loop.run_until_complete(bot.disconnected)
     except (KeyboardInterrupt, SystemExit) as e:
-        logger.error(f'Received {type(e).__name__}, exiting...', exc_info=e)
+        logger.info(f'Received {type(e).__name__}, exiting...', exc_info=e)
         exit_code = e.code if isinstance(e, SystemExit) and e.code is not None else 0
     except Exception as e:
         logger.critical('Uncaught error:', exc_info=e)
         exit_code = 99
     finally:
+        # Set up timeout to prevent hanging during shutdown
         try:
             if getattr(signal, 'SIGALRM', None):
                 signal.alarm(15)
@@ -363,19 +459,26 @@ def main():
             loop.call_later(10, force_quit)
         except Exception as e:
             logger.warning('Error when setting exit timeout (this is a bug, please report it):', exc_info=e)
-        for _ in range(3):
+
+        # Attempt graceful shutdown with retries
+        for attempt in range(3):
             try:
                 loop.run_until_complete(asyncio.shield(post()))
+                break  # Success, exit the retry loop
             except RuntimeError as e:
-                logger.error('Event loop stopped when exiting gracefully (probably caused by a race condition):',
+                logger.error(f'Event loop stopped when exiting gracefully (attempt {attempt + 1}/3):',
                              exc_info=e)
+                if attempt < 2:
+                    sleep(0.5)  # Brief delay before retry
+                    continue
             except Exception as e:
-                logger.critical('Error when exiting gracefully (this is a bug, please report it):', exc_info=e)
-                force_quit()
-            else:
-                break
+                logger.critical(f'Error when exiting gracefully (attempt {attempt + 1}/3):', exc_info=e)
+                if attempt == 2:
+                    force_quit()
         else:
+            logger.critical('Failed to exit gracefully after 3 attempts, forcing quit...')
             force_quit()
+
         logger.log(log.INFO if exit_code == 0 else log.ERROR, f'Exited with code {exit_code}')
         exit(exit_code)
 

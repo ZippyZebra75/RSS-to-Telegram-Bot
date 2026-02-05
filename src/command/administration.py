@@ -20,6 +20,7 @@ from typing_extensions import Final
 
 import asyncio
 import re
+import random
 from telethon import Button
 from telethon.tl import types
 from telethon.utils import get_peer_id

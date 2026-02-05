@@ -58,7 +58,9 @@
         "other_settings_button": "Other settings…",
         "user": "User",
         "channel": "Channel",
-        "group": "Group"
+        "group": "Group",
+        "test_no_subscriptions": "You have no subscriptions yet.",
+        "test_no_entries": "The feed has no entries."
     },
     "l10n_cmd_sub": {
         "sub_reply_feed_url_prompt_html": "Please reply to this message with the URL of an RSS feed.\nOr, you may use <code>/sub url1 url2 url3 …</code> to subscribe in bulk.",

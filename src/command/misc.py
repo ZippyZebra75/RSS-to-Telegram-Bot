@@ -16,15 +16,17 @@
 
 from __future__ import annotations
 from typing import Optional
+import random
 
 from contextlib import suppress
 from telethon import events, types, Button
 from telethon.errors import RPCError
 
-from .. import env, db
+from .. import env, db, web
+from ..parsing.post import get_post_from_entry
 from .utils import (
     command_gatekeeper, get_group_migration_help_msg, set_bot_commands, logger, parse_callback_data_with_page,
-    get_callback_tail,
+    get_callback_tail, parse_command,
 )
 from ..i18n import i18n, get_commands_list
 from . import inner
@@ -167,3 +169,59 @@ async def inline_command_constructor(
         cache_time=3600,
         private=False,
     )
+
+
+@command_gatekeeper(only_manager=False)
+async def cmd_test_random(
+        event: TypeEventMsgHint,
+        *_,
+        lang: Optional[str] = None,
+        chat_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        **__,
+):
+    """
+    Test command: randomly select one of user's subscriptions and fetch the latest 5 entries.
+    Usage: /test
+    """
+    chat_id = chat_id or event.chat_id
+    user_id = user_id or event.sender_id
+
+    # Get all subscriptions for this user
+    subs = await db.Sub.filter(user_id=user_id).select_related('feed').prefetch_related('feed')
+
+    if not subs:
+        await event.respond(i18n[lang]['test_no_subscriptions'])
+        return
+
+    # Randomly select one subscription
+    random_sub = random.choice(subs)
+    feed = random_sub.feed
+
+    # Fetch the RSS feed
+    try:
+        wf = await web.feed_get(feed.link, web_semaphore=False)
+        rss_d = wf.rss_d
+
+        if rss_d is None:
+            await event.respond(wf.error.i18n_message(lang))
+            return
+
+        # Get the latest 5 entries
+        entries_to_send = rss_d.entries[:5]
+
+        if len(entries_to_send) == 0:
+            await event.respond(i18n[lang]['test_no_entries'])
+            return
+
+        # Send each entry
+        for entry in entries_to_send:
+            post = await get_post_from_entry(entry, rss_d.feed.title, wf.url)
+            logger.debug(f"Sending {entry.get('title', 'Untitled')} ({entry.get('link', 'No link')}) to {chat_id}...")
+            await post.test_format(chat_id)
+
+        logger.info(f"Sent {len(entries_to_send)} entries from feed {feed.id} to {chat_id} via /test command")
+
+    except Exception as e:
+        logger.warning(f"Failed to send test feed entries: {e}", exc_info=e)
+        await event.respond('ERROR: ' + i18n[lang]['internal_error'])
